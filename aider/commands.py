@@ -1667,6 +1667,149 @@ class Commands:
         except Exception as e:
             self.io.tool_error(f"Error listing chat histories: {e}")
 
+    def cmd_history(self, args):
+        "Show chat history entries with their token counts"
+        # Get all messages (done_messages + cur_messages)
+        all_messages = self.coder.done_messages + self.coder.cur_messages
+
+        if not all_messages:
+            self.io.tool_output("No chat history entries found.")
+            return
+
+        # Display the chat history entries with indices
+        self.io.tool_output("Chat history entries:")
+
+        # Calculate token usage for the whole history
+        tokens = self.coder.main_model.token_count(all_messages)
+        self.io.tool_output(f"Total tokens in chat history: {tokens:,}")
+
+        # Calculate the width needed for the index numbers
+        index_width = len(str(len(all_messages)))
+
+        # Show entries with their roles, content preview and token counts
+        for i, msg in enumerate(all_messages):
+            role = msg['role']
+            content = msg.get('content', '')
+
+            # Handle multipart messages (like those with images)
+            if isinstance(content, list):
+                # For multipart messages, show a placeholder
+                display_content = "[multipart message]"
+                tokens = self.coder.main_model.token_count(msg)
+            else:
+                # Truncate long content for display
+                if len(content) > 80:
+                    display_content = content[:77] + "..."
+                else:
+                    display_content = content
+
+                # Calculate tokens for this message
+                tokens = self.coder.main_model.token_count(msg)
+
+            self.io.tool_output(
+                f"{i + 1:{index_width}d}: [{role}] ({tokens:,} tokens) {display_content}"
+            )
+
+            # Add a separator every 5 entries for readability
+            if (i + 1) % 5 == 0 and i + 1 < len(all_messages):
+                self.io.tool_output("------")
+
+        self.io.tool_output("\nTo remove entries, use: /history-remove <indices>")
+        self.io.tool_output("Example: /history-remove 5 10-15 20")
+
+    def cmd_history_remove(self, args):
+        "Remove specific entries from chat history to save tokens"
+        # Get all messages (done_messages + cur_messages)
+        all_messages = self.coder.done_messages + self.coder.cur_messages
+
+        if not all_messages:
+            self.io.tool_output("No chat history entries found.")
+            return
+
+        if not args.strip():
+            self.io.tool_error("Please specify which history entries to remove.")
+            self.io.tool_output("Usage: /history-remove <indices>")
+            self.io.tool_output(
+                "Example: /history-remove 5 10-15 20 - removes entries 5, 10 through 15, and 20"
+            )
+            return
+
+        try:
+            # Parse the arguments as indices to remove
+            indices_to_remove = []
+            for part in args.strip().split():
+                # Handle ranges like 5-10
+                if '-' in part:
+                    start, end = map(int, part.split('-'))
+                    indices_to_remove.extend(range(start - 1, end))
+                else:
+                    # Single index
+                    indices_to_remove.append(int(part) - 1)  # Convert to 0-based index
+
+            # Ensure indices are in bounds and unique
+            indices_to_remove = sorted(set(
+                i for i in indices_to_remove if 0 <= i < len(all_messages)
+            ), reverse=True)
+
+            if not indices_to_remove:
+                self.io.tool_error("No valid chat history indices specified.")
+                return
+
+            # Confirm before removal
+            entries_to_remove_info = []
+            for i in indices_to_remove:
+                msg = all_messages[i]
+                content = msg.get("content", "")
+                if isinstance(content, list):  # Handle multipart messages
+                    content = "[multipart message]"
+                elif content and len(content) > 100:
+                    content = content[:97] + "..."
+
+                entries_to_remove_info.append(
+                    f"{i + 1}: [{msg['role']}] {content}"
+                )
+
+            subject = "\n".join(entries_to_remove_info)
+
+            if self.io.confirm_ask(
+                f"Remove {len(indices_to_remove)} chat history entries?",
+                subject=subject
+            ):
+                # Create new message lists without the messages to remove
+                done_len = len(self.coder.done_messages)
+
+                # Create sets for more efficient membership testing
+                done_indices_to_remove = {i for i in indices_to_remove if i < done_len}
+                cur_indices_to_remove = {i - done_len for i in indices_to_remove if i >= done_len}
+
+                # Create new lists excluding the removed messages
+                new_done_messages = [
+                    msg for i, msg in enumerate(self.coder.done_messages)
+                    if i not in done_indices_to_remove
+                ]
+
+                new_cur_messages = [
+                    msg for i, msg in enumerate(self.coder.cur_messages)
+                    if i not in cur_indices_to_remove
+                ]
+
+                # Replace the existing message lists
+                self.coder.done_messages = new_done_messages
+                self.coder.cur_messages = new_cur_messages
+
+                self.io.tool_output(f"Removed {len(indices_to_remove)} chat history entries.")
+
+                # Force summarization if needed
+                if hasattr(self.coder, 'summarize_start'):
+                    self.coder.summarize_start()
+
+        except ValueError as e:
+            self.io.tool_error(f"Error parsing indices: {e}")
+            self.io.tool_output("Usage: /history-remove <indices>")
+            self.io.tool_output(
+                "Example: /history-remove 5 10-15 20 - removes entries 5, 10 through 15, and 20"
+            )
+
     def cmd_think_tokens(self, args):
         "Set the thinking token budget (supports formats like 8096, 8k, 10.5k, 0.5M)"
         model = self.coder.main_model
