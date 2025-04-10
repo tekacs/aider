@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections import OrderedDict
 from os.path import expanduser
 from pathlib import Path
@@ -22,7 +23,7 @@ from aider.llm import litellm
 from aider.repo import ANY_GIT_ERROR
 from aider.run_cmd import run_cmd
 from aider.scrape import Scraper, install_playwright
-from aider.utils import is_image_file
+from aider.utils import is_image_file, split_chat_history_markdown
 
 from .dump import dump  # noqa: F401
 
@@ -1505,6 +1506,166 @@ class Commands:
     def cmd_edit(self, args=""):
         "Alias for /editor: Open an editor to write a prompt"
         return self.cmd_editor(args)
+
+    def completions_raw_export_history(self, document, complete_event):
+        return self.completions_raw_read_only(document, complete_event)
+
+    def cmd_export_history(self, args):
+        "Export the chat history to a file so it can be imported in another session"
+        if not args.strip():
+            self.io.tool_error("Please provide a filename to export the chat history to.")
+            return
+
+        try:
+            output_file = args.strip()
+            # If just a name was provided, create a properly named history file
+            if not output_file.endswith(".md"):
+                output_file = f".aider.chat.history.{output_file}.md"
+
+            # Read current chat history
+            history_content = None
+            if self.io.chat_history_file.exists():
+                try:
+                    history_content = self.io.chat_history_file.read_text(encoding=self.io.encoding)
+                except Exception as e:
+                    self.io.tool_error(f"Error reading current chat history: {e}")
+                    return
+
+            if not history_content:
+                self.io.tool_error("No chat history to export.")
+                return
+
+            # Write the chat history to the specified file
+            output_path = Path(self.coder.root) / output_file
+            output_path.write_text(history_content, encoding=self.io.encoding)
+
+            self.io.tool_output(f"Exported chat history to {output_path}")
+            self.io.tool_output(
+                "You can import this in another session using"
+                f" --restore-chat-history --chat-history-file={output_file}"
+            )
+            self.io.tool_output("Or use /import-history to load it in this session")
+        except Exception as e:
+            self.io.tool_error(f"Error exporting chat history: {e}")
+
+    def completions_raw_import_history(self, document, complete_event):
+        return self.completions_raw_read_only(document, complete_event)
+
+    def cmd_import_history(self, args):
+        "Import a chat history from a file into the current session"
+        if not args.strip():
+            self.io.tool_error("Please provide a filename to import the chat history from.")
+            return
+
+        try:
+            import_file = args.strip()
+            # If just a name was provided, look for a properly named history file
+            if not import_file.endswith(".md"):
+                import_file = f".aider.chat.history.{import_file}.md"
+
+            # Find the file in the repository root
+            import_path = Path(self.coder.root) / import_file
+
+            # If the file doesn't exist as specified, look for it as an absolute path
+            if not import_path.exists() and Path(import_file).exists():
+                import_path = Path(import_file)
+
+            if not import_path.exists():
+                self.io.tool_error(f"History file not found: {import_file}")
+                return
+
+            # Confirm before importing
+            if not self.io.confirm_ask(
+                f"Import chat history from {import_path}?"
+                f" This will replace your current chat history."
+            ):
+                return
+
+            # Read the history file
+            try:
+                history_md = import_path.read_text(encoding=self.io.encoding)
+            except Exception as e:
+                self.io.tool_error(f"Error reading history file: {e}")
+                return
+
+            # Parse the history
+            history = split_chat_history_markdown(history_md)
+            if not history:
+                self.io.tool_error("No chat history found in the file.")
+                return
+
+            # Clear current chat history and add the imported history
+            self.coder.done_messages = []
+            self.coder.cur_messages = []
+            self.coder.done_messages = history
+
+            # Trigger summarization if needed
+            self.coder.summarize_start()
+
+            # Update the chat history file if needed
+            if self.io.chat_history_file != import_path:
+                self.io.tool_output(f"Imported {len(history)} messages from {import_path}")
+
+                # Ask if we should also switch to using this history file
+                if self.io.confirm_ask(
+                    f"Would you like to switch to using {import_path} as your chat history file?"
+                ):
+                    self.io.chat_history_file = import_path
+                    self.io.tool_output(f"Now using {import_path} as chat history file")
+            else:
+                self.io.tool_output(f"Restored {len(history)} messages from {import_path}")
+        except Exception as e:
+            self.io.tool_error(f"Error importing chat history: {e}")
+
+    def cmd_list_histories(self, args):
+        "List all available chat histories"
+        try:
+            # Find all .aider.chat.history*.md files in the repository root
+            search_dir = self.coder.root
+            history_files = list(Path(search_dir).glob(".aider.chat.history*.md"))
+
+            if not history_files:
+                self.io.tool_output("No chat histories found.")
+                return
+
+            # Get current chat history
+            current_history = self.io.chat_history_file
+
+            # Sort by modification time (newest first)
+            history_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+
+            self.io.tool_output("Available chat histories:")
+            for i, history_file in enumerate(history_files):
+                # Calculate size and modification time
+                size_kb = history_file.stat().st_size / 1024
+                mod_time = time.strftime(
+                    "%Y-%m-%d %H:%M",
+                    time.localtime(history_file.stat().st_mtime)
+                )
+
+                # Indicator for current history
+                current = " (current)" if history_file == current_history else ""
+
+                # Count messages in the history file
+                try:
+                    history_md = history_file.read_text(encoding=self.io.encoding)
+                    messages = split_chat_history_markdown(history_md)
+                    message_count = len(messages)
+                    msg_suffix = "s" if message_count != 1 else ""
+                except Exception:
+                    message_count = "?"
+                    msg_suffix = "s"
+
+                self.io.tool_output(f"  {i + 1}. {history_file.name}{current}")
+                self.io.tool_output(
+                    f"     - {message_count} message{msg_suffix},"
+                    f" {size_kb:.1f} KB, modified {mod_time}"
+                )
+
+            self.io.tool_output("\nUse /import-history <name> to load a history")
+            self.io.tool_output("Use /export-history <name> to save current history to a new file")
+        except Exception as e:
+            self.io.tool_error(f"Error listing chat histories: {e}")
 
     def cmd_think_tokens(self, args):
         "Set the thinking token budget (supports formats like 8096, 8k, 10.5k, 0.5M)"

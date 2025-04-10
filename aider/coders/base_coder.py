@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import List
 
 from aider import __version__, models, prompts, urls, utils
+from aider.utils import split_chat_history_markdown
 from aider.analytics import Analytics
 from aider.commands import Commands
 from aider.exceptions import LiteLLMExceptions
@@ -323,6 +324,7 @@ class Coder:
         file_watcher=None,
         auto_copy_context=False,
         auto_accept_architect=True,
+        from_coder=None,
     ):
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
@@ -494,10 +496,73 @@ class Coder:
         self.summarized_done_messages = []
         self.summarizing_messages = None
 
-        if not self.done_messages and restore_chat_history:
+        # Only ask for chat history selection when doing a fresh start with no messages
+        # and not when we're just creating a new Coder instance during a conversation
+        if not self.done_messages and restore_chat_history and from_coder is None:
+            # Ask for a chat history name when starting aider
+            default_chat_history = self.io.chat_history_file
+            chat_histories = []
+
+            # Find all .aider.chat.history*.md files in the current directory or git root
+            search_dir = self.root
+            try:
+                for file in Path(search_dir).glob(".aider.chat.history*.md"):
+                    chat_histories.append(file)
+            except Exception as e:
+                self.io.tool_error(f"Error finding chat histories: {e}")
+
+            # Sort chat histories with the default one first
+            chat_histories = sorted(chat_histories, key=lambda x: (x != default_chat_history, x))
+
+            # Ask the user which chat history to use
+            self.io.tool_output("Chat history options:")
+
+            # Add option for new chat history
+            self.io.tool_output("  0. Create a new named chat history")
+
+            # List existing chat histories if any
+            if chat_histories:
+                self.io.tool_output("Found existing chat histories:")
+                for i, history_file in enumerate(chat_histories):
+                    self.io.tool_output(f"  {i + 1}. {history_file.name}")
+
+            # Ask for selection, defaulting to the first one (default history)
+            self.io.tool_output(
+                "\nWhich chat history would you like to use? (Enter number or name)"
+            )
+            selection = self.io.prompt_ask("Enter selection or name (or press Enter for default): ")
+
+            if selection.strip():
+                try:
+                    # If user selected "Create new"
+                    if selection == "0":
+                        new_name = self.io.prompt_ask("Enter a name for the new chat history: ")
+                        if new_name.strip():
+                            self.io.chat_history_file = Path(search_dir) / \
+                                f".aider.chat.history.{new_name}.md"
+                            self.io.tool_output(
+                                f"Created new chat history: {self.io.chat_history_file.name}"
+                            )
+                    # If user entered a number, get that history
+                    elif selection.isdigit() and 1 <= int(selection) <= len(chat_histories):
+                        self.io.chat_history_file = chat_histories[int(selection) - 1]
+                    # If user entered a filename, use that
+                    elif selection.endswith(".md"):
+                        self.io.chat_history_file = Path(search_dir) / selection
+                    # Otherwise, create a new history with this name
+                    else:
+                        self.io.chat_history_file = Path(search_dir) / \
+                            f".aider.chat.history.{selection}.md"
+                except Exception as e:
+                    self.io.tool_error(f"Error selecting chat history: {e}")
+
+                self.io.tool_output(f"Using chat history: {self.io.chat_history_file.name}")
+
+        # Load the selected chat history if restore_chat_history is enabled
+        if restore_chat_history and not self.done_messages:
             history_md = self.io.read_text(self.io.chat_history_file)
             if history_md:
-                self.done_messages = utils.split_chat_history_markdown(history_md)
+                self.done_messages = split_chat_history_markdown(history_md)
                 self.summarize_start()
 
         # Linting and testing
