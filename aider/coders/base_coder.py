@@ -12,6 +12,16 @@ import re
 import sys
 import threading
 import time
+import json
+import locale
+import math
+import mimetypes
+import os
+import platform
+import re
+import sys
+import threading
+import time
 import traceback
 from collections import defaultdict
 from datetime import datetime
@@ -19,7 +29,7 @@ from json.decoder import JSONDecodeError
 from pathlib import Path
 from typing import List
 
-from aider import __version__, models, prompts, urls, utils
+from aider import __version__, mab, models, prompts, urls, utils
 from aider.analytics import Analytics
 from aider.commands import Commands
 from aider.exceptions import LiteLLMExceptions
@@ -327,9 +337,32 @@ class Coder:
         file_watcher=None,
         auto_copy_context=False,
         auto_accept_architect=True,
+        # MAB args
+        enable_mab=False,
+        mab_models=None,
+        judge_model=None,
+        mab_algorithm="thompson",
+        mab_state_file=".aider.mab.state.json",
     ):
         # Fill in a dummy Analytics if needed, but it is never .enable()'d
         self.analytics = analytics if analytics is not None else Analytics()
+
+        # MAB setup
+        self.enable_mab = enable_mab
+        self.mab_instance = None
+        self.judge_model = None
+        if self.enable_mab:
+            if not mab_models:
+                raise ValueError("MAB enabled, but no --mab-models specified.")
+            if not judge_model:
+                raise ValueError("MAB enabled, but no --judge-model specified.")
+
+            self.mab_instance = mab.get_mab_instance(
+                mab_algorithm, mab_models, mab_state_file
+            )
+            self.judge_model = models.Model(judge_model, verbose=verbose)
+            # Sanity check the judge model
+            models.sanity_check_model(io, self.judge_model)
 
         self.event = self.analytics.event
         self.chat_language = chat_language
@@ -1477,6 +1510,25 @@ class Coder:
             self.remove_reasoning_content()
             self.multi_response_content = ""
 
+            # MAB: Judge the response and update the bandit
+            if self.enable_mab and self.chosen_arm and not interrupted:
+                user_request_content = ""
+                # Find the last user message in cur_messages to get the request
+                for msg in reversed(self.cur_messages):
+                    if msg["role"] == "user":
+                        user_request_content = msg["content"]
+                        break
+
+                if user_request_content and self.partial_response_content:
+                    self.io.tool_output(f"MAB: Judging response from {self.chosen_arm}...")
+                    reward = self._judge_response(user_request_content, self.partial_response_content)
+                    self.io.tool_output(f"MAB: Awarded reward {reward} to {self.chosen_arm}")
+                    self.mab_instance.update(self.chosen_arm, reward)
+                else:
+                    self.io.tool_warning("MAB: Could not find user request or assistant response for judging.")
+
+                self.chosen_arm = None # Reset after use
+
         ###
         # print()
         # print("=" * 20)
@@ -1739,7 +1791,15 @@ class Coder:
         self.got_reasoning_content = False
         self.ended_reasoning_content = False
 
-        if not model:
+        # MAB: Select model if enabled
+        self.chosen_arm = None # Initialize instance variable
+        if self.enable_mab and self.mab_instance:
+            self.chosen_arm = self.mab_instance.select_arm()
+            model = models.Model(self.chosen_arm, verbose=self.verbose)
+            # Sanity check the chosen model (optional, could be slow)
+            # models.sanity_check_model(self.io, model)
+            self.io.tool_output(f"MAB selected model: {model.name}")
+        elif not model:
             model = self.main_model
 
         self.partial_response_content = ""
@@ -1787,6 +1847,8 @@ class Coder:
                 args = self.parse_partial_args()
                 if args:
                     self.io.ai_output(json.dumps(args, indent=4))
+
+            # MAB judging logic moved to send_message's finally block
 
     def show_send_output(self, completion):
         if self.verbose:
@@ -2415,3 +2477,46 @@ class Coder:
             line_plural = "line" if num_lines == 1 else "lines"
             self.io.tool_output(f"Added {num_lines} {line_plural} of output to the chat.")
             return accumulated_output
+
+    def _judge_response(self, user_request, assistant_response):
+        """
+        Uses the judge_model to evaluate the assistant's response.
+        Returns a reward (1 for GOOD, 0 for BAD).
+        """
+        if not self.judge_model:
+            self.io.tool_warning("MAB judge model not configured.")
+            return 0.5 # Default neutral reward if no judge
+
+        judge_prompt = f"""You are an impartial judge evaluating an AI assistant's response to a user request.
+The user requested:
+{user_request}
+
+The assistant responded:
+{assistant_response}
+
+Based *only* on the assistant's response fulfilling the user's request, evaluate the response as either GOOD or BAD.
+Respond with only the single word "GOOD" or "BAD"."""
+
+        judge_messages = [{"role": "user", "content": judge_prompt}]
+
+        try:
+            judge_eval_text = self.judge_model.simple_send_with_retries(judge_messages)
+
+            if not judge_eval_text:
+                self.io.tool_warning("MAB Judge returned no response.")
+                return 0.5 # Neutral reward on judge failure
+
+            judge_eval_text = judge_eval_text.strip().upper()
+            self.io.tool_output(f"MAB Judge evaluation: {judge_eval_text}")
+
+            if judge_eval_text.startswith("GOOD"):
+                return 1.0
+            elif judge_eval_text.startswith("BAD"):
+                return 0.0
+            else:
+                self.io.tool_warning(f"MAB Judge returned unexpected response: {judge_eval_text}")
+                return 0.5 # Neutral reward on unexpected response
+
+        except Exception as e:
+            self.io.tool_error(f"Error during MAB judge evaluation: {e}")
+            return 0.5 # Neutral reward on error

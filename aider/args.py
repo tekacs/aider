@@ -217,6 +217,41 @@ def get_parser(default_config_files, git_root):
     )
 
     ##########
+    group = parser.add_argument_group("Multi-Armed Bandit (MAB) settings")
+    group.add_argument(
+        "--enable-mab",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable Multi-Armed Bandit for dynamic model selection (default: False)",
+    )
+    group.add_argument(
+        "--mab-models",
+        action="append",
+        metavar="MODEL",
+        help="Specify a model to include in the MAB pool (can be used multiple times)",
+        default=[],
+    )
+    group.add_argument(
+        "--judge-model",
+        metavar="JUDGE_MODEL",
+        default=None,
+        help="Specify the model to use as the judge for MAB evaluations",
+    )
+    group.add_argument(
+        "--mab-algorithm",
+        choices=["epsilon-greedy", "ucb1", "thompson"],
+        default="thompson",
+        help="Specify the MAB algorithm to use (default: thompson)",
+    )
+    group.add_argument(
+        "--mab-state-file",
+        metavar="MAB_STATE_FILE",
+        default=".aider.mab.state.json",
+        help="Specify the file to store MAB state (default: .aider.mab.state.json)",
+    )
+
+
+    ##########
     group = parser.add_argument_group("Cache settings")
     group.add_argument(
         "--cache-prompts",
